@@ -2,7 +2,7 @@
   "mcpServers": {
     "zabbix": {
       "type": "stdio",
-      "command": "/Users/higorcampos/Documents/GitHub/mcp-zabbix/.venv/bin/python",
+      "command": "/home/sosa/ZABBX-MCP/.venv/bin/python",
       "args": ["-m", "mcp_zabbix"]
     }
   }
