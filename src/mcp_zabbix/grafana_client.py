@@ -105,10 +105,14 @@ class GrafanaClient:
     async def health(self) -> dict[str, Any]:
         return await self.request("GET", "/api/health")
 
-    async def search_dashboards(self, query: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    async def search_dashboards(
+        self, query: str | None = None, limit: int = 100, *, uids: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"type": "dash-db", "limit": limit}
         if query:
             params["query"] = query
+        if uids:
+            params["dashboardUIDs"] = uids
         return await self.request("GET", "/api/search", params=params)
 
     async def save_dashboard(

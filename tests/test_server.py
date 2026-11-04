@@ -29,7 +29,7 @@ READ_TOOLS = {
 WRITE_TOOLS = {
     "create_host_group", "create_host", "update_host", "set_host_macro", "delete_host",
     "create_item", "create_trigger", "acknowledge_problem", "create_maintenance",
-    "delete_maintenance", "api_call", "create_host_dashboard",
+    "delete_maintenance", "api_call", "create_host_dashboard", "delete_dashboard",
 }
 
 
@@ -58,7 +58,7 @@ async def test_lists_every_tool_with_the_right_hints(make_client: MakeClient) ->
     for name in WRITE_TOOLS:
         assert tools[name].annotations is not None
         assert tools[name].annotations.read_only_hint is False, name
-    for name in ("delete_host", "delete_maintenance", "api_call"):
+    for name in ("delete_host", "delete_maintenance", "api_call", "delete_dashboard"):
         assert tools[name].annotations.destructive_hint is True, name
     assert all(t.description for t in tools.values())
 

@@ -1540,6 +1540,32 @@ async def create_host_dashboard(
     }
 
 
+@mcp.tool(title="Apagar dashboard do Grafana", annotations=DESTRUCTIVE)
+async def delete_dashboard(
+    dashboard: Annotated[str, Field(description="uid do dashboard ou título exato.", min_length=1)],
+    ctx: Ctx,
+    confirm: Annotated[
+        bool, Field(description="Precisa ser true. Só use depois de o usuário confirmar.")
+    ] = False,
+) -> dict[str, Any]:
+    """Apaga um dashboard do Grafana."""
+    _ensure_writable(ctx)
+    ref = dashboard.strip()
+    found = await _grafana_call(ctx, "search_dashboards", uids=[ref])
+    if not found:
+        matches = await _grafana_call(ctx, "search_dashboards", ref)
+        found = [d for d in matches if d.get("title") == ref]
+    if not found:
+        raise ToolError(f"Dashboard não encontrado: {dashboard!r}. Use list_dashboards.")
+    if len(found) > 1:
+        uids = ", ".join(d["uid"] for d in found)
+        raise ToolError(f"Mais de um dashboard com o título {dashboard!r} ({uids}); use o uid.")
+    target = found[0]
+    _require_confirm(confirm, f"apagar o dashboard {target['title']!r} (uid {target['uid']})")
+    await _grafana_call(ctx, "delete_dashboard", target["uid"])
+    return {"deleted": True, "uid": target["uid"], "title": target["title"]}
+
+
 # --- Health, Resource e Prompts ---------------------------------------------
 
 
