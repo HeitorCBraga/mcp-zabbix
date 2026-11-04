@@ -46,5 +46,21 @@ services:
       - zabbix-server
     restart: unless-stopped
 
+  grafana:
+    image: grafana/grafana:12.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_PLUGINS_PREINSTALL: alexanderzobnin-zabbix-app
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - zabbix-web
+    restart: unless-stopped
+
 volumes:
   zabbix-db:
+  grafana-data:

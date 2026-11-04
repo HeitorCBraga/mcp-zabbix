@@ -1,0 +1,6 @@
+# Habilita o app do Zabbix (instalado via GF_PLUGINS_PREINSTALL).
+apiVersion: 1
+
+apps:
+  - type: alexanderzobnin-zabbix-app
+    disabled: false
