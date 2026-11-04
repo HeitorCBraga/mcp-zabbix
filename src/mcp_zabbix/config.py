@@ -127,3 +127,42 @@ class Settings:
             verify_tls=parse_bool(os.getenv("ZABBIX_VERIFY_TLS"), True),
             read_only=parse_bool(os.getenv("ZABBIX_READ_ONLY"), False),
         )
+
+
+DEFAULT_GRAFANA_URL = "http://localhost:3000"
+DEFAULT_GRAFANA_DATASOURCE_UID = "zabbix"
+
+
+@dataclass(frozen=True)
+class GrafanaSettings:
+    """Parâmetros de conexão com o Grafana, onde os dashboards são criados."""
+
+    url: str = DEFAULT_GRAFANA_URL
+    api_token: str | None = None
+    user: str | None = None
+    password: str | None = None
+    # uid do datasource do plugin do Zabbix que os painéis vão consultar.
+    datasource_uid: str = DEFAULT_GRAFANA_DATASOURCE_UID
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    verify_tls: bool = True
+
+    @property
+    def base_url(self) -> str:
+        return self.url.strip().rstrip("/")
+
+    @property
+    def has_credentials(self) -> bool:
+        return bool(self.api_token or (self.user and self.password))
+
+    @classmethod
+    def from_env(cls) -> GrafanaSettings:
+        return cls(
+            url=os.getenv("GRAFANA_URL", "").strip() or DEFAULT_GRAFANA_URL,
+            api_token=os.getenv("GRAFANA_API_TOKEN", "").strip() or None,
+            user=os.getenv("GRAFANA_USER", "").strip() or None,
+            password=os.getenv("GRAFANA_PASSWORD") or None,
+            datasource_uid=os.getenv("GRAFANA_DATASOURCE_UID", "").strip()
+            or DEFAULT_GRAFANA_DATASOURCE_UID,
+            timeout_seconds=_env_float("GRAFANA_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
+            verify_tls=parse_bool(os.getenv("GRAFANA_VERIFY_TLS"), True),
+        )

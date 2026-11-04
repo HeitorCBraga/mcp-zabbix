@@ -16,6 +16,7 @@ Convenções das Tools:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -38,7 +39,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .client import ZabbixClient, ZabbixError
-from .config import Settings
+from .config import GrafanaSettings, Settings
+from .grafana_client import GrafanaClient, GrafanaError
 
 logger = logging.getLogger("mcp_zabbix.server")
 # O httpx2 registra uma linha INFO por requisição; com dezenas de chamadas por
@@ -122,6 +124,7 @@ class AppContext:
     """Objeto compartilhado por todos os handlers durante a vida do servidor."""
 
     zabbix: ZabbixClient
+    grafana: GrafanaClient
 
 
 def create_client() -> ZabbixClient:
@@ -133,20 +136,31 @@ def create_client() -> ZabbixClient:
     return ZabbixClient(Settings.from_env())
 
 
+def create_grafana_client() -> GrafanaClient:
+    """Monta o cliente do Grafana a partir das variáveis de ambiente.
+
+    Como `create_client`, os testes substituem esta função.
+    """
+    return GrafanaClient(GrafanaSettings.from_env())
+
+
 @asynccontextmanager
 async def lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
-    """Cria o cliente HTTP na inicialização e o fecha no desligamento."""
+    """Cria os clientes HTTP na inicialização e os fecha no desligamento."""
     client = create_client()
     logger.info(
         "cliente do Zabbix pronto (endpoint=%s, somente_leitura=%s)",
         client.endpoint,
         client.settings.read_only,
     )
+    grafana = create_grafana_client()
+    logger.info("cliente do Grafana pronto (url=%s)", grafana.settings.base_url)
     try:
-        yield AppContext(zabbix=client)
+        yield AppContext(zabbix=client, grafana=grafana)
     finally:
         await client.aclose()
-        logger.info("cliente do Zabbix encerrado")
+        await grafana.aclose()
+        logger.info("clientes do Zabbix e do Grafana encerrados")
 
 
 INSTRUCTIONS: Final = (
@@ -183,6 +197,18 @@ async def _api(ctx: Ctx, method: str, params: Any = None) -> Any:
     try:
         return await _zabbix(ctx).call(method, params)
     except ZabbixError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _grafana(ctx: Ctx) -> GrafanaClient:
+    return ctx.request_context.lifespan_context.grafana
+
+
+async def _grafana_call(ctx: Ctx, method: str, *args: Any, **kwargs: Any) -> Any:
+    """Chama um método do cliente do Grafana e traduz falhas para o modelo."""
+    try:
+        return await getattr(_grafana(ctx), method)(*args, **kwargs)
+    except GrafanaError as exc:
         raise ToolError(str(exc)) from exc
 
 
@@ -1369,6 +1395,149 @@ async def api_call(
             f"Resposta grande demais ({size} caracteres). Reduza com 'output', filtros e 'limit'."
         )
     return {"method": method, "result": result}
+
+
+# --- Grafana ----------------------------------------------------------------
+
+
+@mcp.tool(title="Listar dashboards do Grafana", annotations=READ_ONLY)
+async def list_dashboards(ctx: Ctx, search: Search = None, limit: Limit = 50) -> dict[str, Any]:
+    """Lista os dashboards do Grafana com título, uid, pasta, tags e link."""
+    found = await _grafana_call(ctx, "search_dashboards", search, limit)
+    base = _grafana(ctx).settings.base_url
+    items = [
+        {
+            "uid": d.get("uid"),
+            "title": d.get("title"),
+            "folder": d.get("folderTitle") or "General",
+            "tags": d.get("tags") or [],
+            "url": f"{base}{d.get('url', '')}",
+        }
+        for d in found
+    ]
+    return {"count": len(items), "items": items}
+
+
+# Itens do template "Linux by Zabbix agent" usados quando a IA não escolhe os itens.
+DEFAULT_DASHBOARD_ITEMS: Final = (
+    "CPU utilization",
+    "Memory utilization",
+    "Load average (1m avg)",
+    "Free swap space in %",
+)
+# Unidade do item no Zabbix → unidade do painel no Grafana.
+GRAFANA_UNITS: Final = {"%": "percent", "B": "bytes", "bps": "bps", "s": "s", "Bps": "Bps"}
+GRAFANA_ZABBIX_DATASOURCE: Final = "alexanderzobnin-zabbix-datasource"
+
+
+def _grafana_panel(
+    panel_id: int, item: dict[str, Any], group: str, host: str, datasource_uid: str
+) -> dict[str, Any]:
+    """Um painel de série temporal para um item, dois painéis por linha."""
+    position = panel_id - 1
+    datasource = {"type": GRAFANA_ZABBIX_DATASOURCE, "uid": datasource_uid}
+    return {
+        "id": panel_id,
+        "type": "timeseries",
+        "title": item["name"],
+        "gridPos": {"x": (position % 2) * 12, "y": (position // 2) * 8, "w": 12, "h": 8},
+        "datasource": datasource,
+        "fieldConfig": {
+            "defaults": {"unit": GRAFANA_UNITS.get(item.get("units", ""), "short")},
+            "overrides": [],
+        },
+        "targets": [
+            {
+                "refId": "A",
+                "queryType": "0",
+                "datasource": datasource,
+                "group": {"filter": group},
+                "host": {"filter": host},
+                "item": {"filter": item["name"]},
+                "functions": [],
+            }
+        ],
+    }
+
+
+@mcp.tool(title="Criar dashboard de host no Grafana", annotations=IDEMPOTENT_WRITE)
+async def create_host_dashboard(
+    host: HostRef,
+    ctx: Ctx,
+    items: Annotated[
+        list[str] | None,
+        Field(
+            description="Nomes exatos dos itens (veja list_items). Vazio usa CPU, memória, "
+            "load e swap do template Linux.",
+            max_length=24,
+        ),
+    ] = None,
+    title: Annotated[str | None, Field(description="Título do dashboard. Padrão: nome do host.")] = None,
+) -> dict[str, Any]:
+    """Cria no Grafana um dashboard com um gráfico por item numérico de um host do
+    Zabbix, lido pelo plugin do Zabbix. Chamar de novo com o mesmo host e o mesmo
+    título atualiza esse dashboard em vez de criar outro; outro título cria outro."""
+    _ensure_writable(ctx)
+    found = await _find_host(ctx, host, selectHostGroups=["name"])
+    groups = [g["name"] for g in found.get("hostgroups", [])]
+    if not groups:
+        raise ToolError(f"O host {found['host']!r} não está em nenhum grupo.")
+
+    numeric = await _api(
+        ctx,
+        "item.get",
+        {
+            "output": ["itemid", "name", "key_", "units"],
+            "hostids": [found["hostid"]],
+            "filter": {"value_type": [VALUE_TYPES["float"], VALUE_TYPES["unsigned"]], "status": 0},
+            "sortfield": "name",
+        },
+    )
+    by_name = {i["name"].lower(): i for i in numeric}
+
+    if items:
+        wanted = _unique(items)
+        missing = [name for name in wanted if name.lower() not in by_name]
+        if missing:
+            hints = [i["name"] for i in numeric if any(m.lower() in i["name"].lower() for m in missing)]
+            hint = f" Parecidos: {', '.join(hints[:10])}." if hints else " Use list_items para ver os nomes."
+            raise ToolError(f"Itens numéricos não encontrados em {found['host']!r}: {missing}.{hint}")
+        chosen = [by_name[name.lower()] for name in wanted]
+    else:
+        chosen = [by_name[name.lower()] for name in DEFAULT_DASHBOARD_ITEMS if name.lower() in by_name]
+        if not chosen:
+            raise ToolError(
+                f"O host {found['host']!r} não tem os itens padrão ({', '.join(DEFAULT_DASHBOARD_ITEMS)}). "
+                "Informe 'items' com nomes de list_items."
+            )
+
+    grafana = _grafana(ctx).settings
+    dashboard_title = (title or "").strip() or found["name"]
+    # uid estável por host + título: repetir a chamada atualiza o mesmo dashboard.
+    uid = f"zbx-{found['hostid']}"
+    if dashboard_title != found["name"]:
+        uid += "-" + hashlib.sha1(dashboard_title.encode()).hexdigest()[:8]
+    dashboard = {
+        "uid": uid,
+        "title": dashboard_title,
+        "tags": ["zabbix", "mcp"],
+        "time": {"from": "now-6h", "to": "now"},
+        "refresh": "1m",
+        "panels": [
+            _grafana_panel(n, item, groups[0], found["name"], grafana.datasource_uid)
+            for n, item in enumerate(chosen, start=1)
+        ],
+    }
+    saved = await _grafana_call(ctx, "save_dashboard", dashboard)
+    return {
+        "uid": saved.get("uid"),
+        "title": dashboard["title"],
+        "url": f"{grafana.base_url}{saved.get('url', '')}",
+        "version": saved.get("version"),
+        "host": found["host"],
+        "group": groups[0],
+        "panels": [i["name"] for i in chosen],
+    }
 
 
 # --- Health, Resource e Prompts ---------------------------------------------

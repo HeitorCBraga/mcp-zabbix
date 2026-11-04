@@ -24,11 +24,12 @@ MakeClient = Callable[..., AbstractAsyncContextManager[Client]]
 READ_TOOLS = {
     "get_overview", "list_host_groups", "list_templates", "list_hosts", "get_host",
     "list_items", "get_item_history", "list_triggers", "list_problems", "list_maintenances",
+    "list_dashboards",
 }
 WRITE_TOOLS = {
     "create_host_group", "create_host", "update_host", "set_host_macro", "delete_host",
     "create_item", "create_trigger", "acknowledge_problem", "create_maintenance",
-    "delete_maintenance", "api_call",
+    "delete_maintenance", "api_call", "create_host_dashboard",
 }
 
 
