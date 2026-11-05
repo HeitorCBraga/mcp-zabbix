@@ -1,11 +1,13 @@
-"""Fixtures compartilhadas. Nenhum teste deste diretório acessa um Zabbix real.
+"""Fixtures compartilhadas. Nenhum teste deste diretório acessa um Zabbix ou Grafana real.
 
 `FakeZabbix` imita, em memória, o subconjunto da API JSON-RPC que as Tools usam,
-incluindo a autenticação por sessão (login, expiração e `Bearer`).
+incluindo a autenticação por sessão (login, expiração e `Bearer`). `FakeGrafana`
+faz o mesmo com a API REST de dashboards do Grafana.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -17,7 +19,8 @@ from mcp import Client
 
 from mcp_zabbix import server as server_module
 from mcp_zabbix.client import ZabbixClient
-from mcp_zabbix.config import Settings
+from mcp_zabbix.config import GrafanaSettings, Settings
+from mcp_zabbix.grafana_client import GrafanaClient
 
 SESSION = "session-token-1"
 
@@ -294,6 +297,10 @@ class FakeZabbix:
             rows = [i for i in rows if i["itemid"] in p["itemids"]]
         if "hostids" in p:
             rows = [i for i in rows if i["hostid"] in p["hostids"]]
+        for key, values in p.get("filter", {}).items():
+            wanted = [str(v) for v in (values if isinstance(values, list) else [values])]
+            # Itens cadastrados sem `status` contam como habilitados ("0").
+            rows = [i for i in rows if str(i.get(key, "0")) in wanted]
         if "selectHosts" in p:
             for row in rows:
                 row["hosts"] = [{"host": self.hosts[row["hostid"]]["host"]}]
@@ -301,6 +308,55 @@ class FakeZabbix:
 
     def m_history_get(self, p: dict[str, Any]) -> list[dict[str, Any]]:
         return [dict(point) for point in self.history][: p.get("limit", len(self.history))]
+
+
+class FakeGrafana:
+    """Grafana em memória: health, busca, criação e remoção de dashboards."""
+
+    def __init__(self) -> None:
+        self.dashboards: dict[str, dict[str, Any]] = {}
+        self.versions: dict[str, int] = {}
+        self.calls: list[tuple[str, str]] = []
+        self.password = "admin"
+
+    def add(self, uid: str, title: str) -> None:
+        self.dashboards[uid] = {"uid": uid, "title": title, "panels": []}
+        self.versions[uid] = 1
+
+    def handle(self, request: httpx2.Request) -> httpx2.Response:
+        method, path = request.method, request.url.path
+        self.calls.append((method, path))
+
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Basic ") or base64.b64decode(auth[6:]).decode() != f"admin:{self.password}":
+            return httpx2.Response(401, json={"message": "Invalid username or password"})
+
+        if method == "GET" and path == "/api/health":
+            return httpx2.Response(200, json={"database": "ok", "version": "12.2.0"})
+        if method == "GET" and path == "/api/search":
+            uids = request.url.params.get_list("dashboardUIDs")
+            query = (request.url.params.get("query") or "").lower()
+            rows = [
+                {"uid": d["uid"], "title": d["title"], "url": f"/d/{d['uid']}/x", "tags": d.get("tags", [])}
+                for d in self.dashboards.values()
+                if (not uids or d["uid"] in uids) and query in d["title"].lower()
+            ]
+            return httpx2.Response(200, json=rows)
+        if method == "POST" and path == "/api/dashboards/db":
+            dashboard = json.loads(request.content)["dashboard"]
+            uid = dashboard["uid"]
+            self.versions[uid] = self.versions.get(uid, 0) + 1
+            self.dashboards[uid] = dashboard
+            return httpx2.Response(
+                200,
+                json={"status": "success", "uid": uid, "url": f"/d/{uid}/x", "version": self.versions[uid]},
+            )
+        if method == "DELETE" and path.startswith("/api/dashboards/uid/"):
+            uid = path.rsplit("/", 1)[1]
+            if self.dashboards.pop(uid, None) is None:
+                return httpx2.Response(404, json={"message": "Dashboard not found"})
+            return httpx2.Response(200, json={"title": "x", "message": "Dashboard deleted"})
+        return httpx2.Response(404, json={"message": "Not found"})
 
 
 @pytest.fixture(scope="session")
@@ -314,6 +370,11 @@ def fake() -> FakeZabbix:
     return FakeZabbix()
 
 
+@pytest.fixture
+def grafana() -> FakeGrafana:
+    return FakeGrafana()
+
+
 def make_settings(**overrides: Any) -> Settings:
     values: dict[str, Any] = {"url": "http://zbx.test", "user": "Admin", "password": "secret"}
     values.update(overrides)
@@ -322,9 +383,9 @@ def make_settings(**overrides: Any) -> Settings:
 
 @pytest.fixture
 def make_client(
-    monkeypatch: pytest.MonkeyPatch, fake: FakeZabbix
+    monkeypatch: pytest.MonkeyPatch, fake: FakeZabbix, grafana: FakeGrafana
 ) -> Callable[..., AbstractAsyncContextManager[Client]]:
-    """Servidor MCP real (em memória), ligado ao Zabbix falso."""
+    """Servidor MCP real (em memória), ligado ao Zabbix e ao Grafana falsos."""
 
     @asynccontextmanager
     async def _make(**settings_overrides: Any) -> AsyncIterator[Client]:
@@ -333,6 +394,12 @@ def make_client(
             server_module,
             "create_client",
             lambda: ZabbixClient(settings, transport=httpx2.MockTransport(fake.handle)),
+        )
+        grafana_settings = GrafanaSettings(url="http://grafana.test", user="admin", password="admin")
+        monkeypatch.setattr(
+            server_module,
+            "create_grafana_client",
+            lambda: GrafanaClient(grafana_settings, transport=httpx2.MockTransport(grafana.handle)),
         )
         async with Client(server_module.mcp, raise_exceptions=True) as connected:
             yield connected
