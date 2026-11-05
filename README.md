@@ -2,18 +2,28 @@
 
 MCP Server para **consultar e gerenciar um Zabbix** pela API JSON-RPC: lista hosts,
 problemas, triggers e itens, e também cria hosts, grupos, macros, itens, triggers e
-janelas de manutenção. Feito em Python com o SDK oficial do MCP (`mcp` 2.x).
+janelas de manutenção. Também **cria dashboards no Grafana** a partir dos itens de um
+host do Zabbix. Feito em Python com o SDK oficial do MCP (`mcp` 2.x).
 
 Testado contra o Zabbix **7.4**. Usa só a API pública; não precisa de acesso ao banco.
 
 ## Início rápido (laboratório local)
 
 O `docker-compose.yml` deste repositório sobe um Zabbix 7.4 completo
-(PostgreSQL, server, web e agent) em `http://localhost:8080`:
+(PostgreSQL, server, web e agent) em `http://localhost:8080` e um Grafana 12 em
+`http://localhost:3000` (`admin`/`admin`), já com o plugin do Zabbix e o datasource
+`Zabbix` configurados:
 
 ```bash
 docker compose up -d
 ```
+
+Se a porta 8080 ou 3000 estiver ocupada, defina `ZABBIX_WEB_PORT` ou `GRAFANA_PORT`
+(no shell ou no `.env`) e ajuste `ZABBIX_URL` / `GRAFANA_URL`.
+
+No banco novo, o host "Zabbix server" vem com a interface do agent em `127.0.0.1`,
+mas o agent roda no container `zabbix-agent`. Para os gráficos terem dados, troque a
+interface para o DNS `zabbix-agent` (em *Data collection › Hosts*, ou pedindo à IA).
 
 Depois prepare o servidor MCP:
 
@@ -72,6 +82,11 @@ no ambiente vencem o arquivo.
 | `MCP_TRANSPORT` | `stdio` | `stdio` ou `streamable-http`. |
 | `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` | Endereço do modo HTTP (`/mcp`, com `/health`). |
 | `MCP_LOG_LEVEL` | `INFO` | Nível de log (vai para o stderr). |
+| `GRAFANA_URL` | `http://localhost:3000` | URL base do Grafana onde os dashboards são criados. |
+| `GRAFANA_API_TOKEN` | — | Token de service account. Tem prioridade sobre usuário e senha. |
+| `GRAFANA_USER` / `GRAFANA_PASSWORD` | — | Login HTTP Basic no Grafana. |
+| `GRAFANA_DATASOURCE_UID` | `zabbix` | uid do datasource do plugin do Zabbix que os painéis consultam. |
+| `GRAFANA_VERIFY_TLS` / `GRAFANA_TIMEOUT_SECONDS` | `true` / `15` | Como os equivalentes do Zabbix. |
 | `MCP_EXTRA_ALLOWED_HOSTS` / `MCP_EXTRA_ALLOWED_ORIGINS` | — | Hosts/origens extras aceitos no modo HTTP (proteção contra DNS rebinding). |
 
 Modo HTTP, se preferir um servidor de pé em vez de stdio:
@@ -109,11 +124,22 @@ MCP_TRANSPORT=streamable-http .venv/bin/python -m mcp_zabbix
 | `delete_host`, `delete_maintenance` | Apagam, e só com `confirm=true`. |
 | `api_call` | Qualquer outro método da API. Fora do `.get`, respeita o modo somente leitura. |
 
+**Grafana**
+
+| Tool | O que faz |
+| --- | --- |
+| `list_dashboards` | Dashboards com título, uid, pasta, tags e link completo. |
+| `create_host_dashboard` | Um gráfico por item numérico de um host (padrão: CPU, memória, load e swap). Repetir com o mesmo título atualiza o dashboard; outro título cria outro. |
+| `delete_dashboard` | Apaga por uid ou título exato, e só com `confirm=true`. |
+
+As Tools do Grafana que alteram algo também respeitam `ZABBIX_READ_ONLY`.
+
 Também há o Resource `zabbix://guide` e os Prompts `diagnose_host` e `triage_problems`.
 
 Exemplos de pedidos: *"quais hosts estão indisponíveis?"*, *"crie o host app-prod-03
 (10.20.1.33) no grupo Linux servers/Web com o template Linux by Zabbix agent"*,
-*"coloque os hosts do grupo Network em manutenção por 2 horas"*.
+*"coloque os hosts do grupo Network em manutenção por 2 horas"*, *"crie no Grafana um
+dashboard com o tráfego de rede do Zabbix server"*.
 
 ## Segurança
 
@@ -131,10 +157,12 @@ Exemplos de pedidos: *"quais hosts estão indisponíveis?"*, *"crie o host app-p
 
 ```bash
 .venv/bin/pip install pytest anyio
-.venv/bin/python -m pytest                      # testes offline (Zabbix simulado em memória)
+.venv/bin/python -m pytest                      # testes offline (Zabbix e Grafana simulados em memória)
 .venv/bin/python scripts/smoke_test.py          # ponta a ponta, contra o Zabbix real
 .venv/bin/python scripts/smoke_test.py --ack    # idem, e reconhece/desfaz um problema existente
 ```
 
-Estrutura: `src/mcp_zabbix/` (`config.py`, `client.py` com login/sessão, `server.py`
-com as Tools, `__main__.py` com o transporte), `tests/` e `scripts/smoke_test.py`.
+Estrutura: `src/mcp_zabbix/` (`config.py`, `client.py` com login/sessão,
+`grafana_client.py` com a API REST do Grafana, `server.py` com as Tools, `__main__.py`
+com o transporte), `grafana/provisioning/` (datasource e plugin do laboratório),
+`tests/` e `scripts/smoke_test.py`.

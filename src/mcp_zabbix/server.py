@@ -171,7 +171,10 @@ INSTRUCTIONS: Final = (
     "create_maintenance. delete_host e delete_maintenance exigem confirm=true: peça "
     "confirmação ao usuário antes. api_call é a saída de emergência para qualquer "
     "outro método da API. Antes de criar um host, confira os grupos (list_host_groups) "
-    "e os templates (list_templates) com os nomes exatos."
+    "e os templates (list_templates) com os nomes exatos. Para o Grafana, "
+    "create_host_dashboard monta um dashboard com os itens numéricos de um host (use "
+    "list_items para os nomes exatos); list_dashboards lista os existentes e "
+    "delete_dashboard exige confirm=true."
 )
 
 mcp = MCPServer(
@@ -1590,6 +1593,7 @@ interpreta os resultados é a aplicação de IA conectada.
 | `list_items` / `get_item_history` | Itens, último valor e histórico |
 | `list_triggers` / `list_problems` | Alertas configurados e problemas ativos |
 | `list_maintenances` | Janelas de manutenção |
+| `list_dashboards` | Dashboards do Grafana, com link |
 
 ## Alterar
 
@@ -1601,6 +1605,8 @@ interpreta os resultados é a aplicação de IA conectada.
 | `create_maintenance` | Janela de manutenção |
 | `delete_host`, `delete_maintenance` | Apagar (exigem `confirm=true`) |
 | `api_call` | Qualquer outro método da API |
+| `create_host_dashboard` | Dashboard no Grafana com um gráfico por item numérico de um host |
+| `delete_dashboard` | Apagar dashboard do Grafana (exige `confirm=true`) |
 
 Com `ZABBIX_READ_ONLY=true` todas as Tools que alteram recusam a chamada.
 
@@ -1621,6 +1627,8 @@ Com `ZABBIX_READ_ONLY=true` todas as Tools que alteram recusam a chamada.
 - Hosts novos levam até um minuto para a primeira coleta.
 - O nome de grupo `Pai/Filho` forma hierarquia; filtrar por `Pai` inclui os filhos.
 - Valores de macros secretas nunca são devolvidos.
+- `create_host_dashboard` só aceita itens numéricos; sem `items`, usa CPU, memória,
+  load e swap do template Linux. O mesmo host e título atualizam o mesmo dashboard.
 """
 
 
