@@ -77,8 +77,9 @@ async def test_create_host_dashboard_uses_default_items(
     saved = grafana.dashboards[f"zbx-{host_id}"]
     assert saved["title"] == "Web 01"
     cpu, memory = saved["panels"]
-    assert cpu["gridPos"] == {"x": 0, "y": 0, "w": 12, "h": 8}
-    assert memory["gridPos"] == {"x": 12, "y": 0, "w": 12, "h": 8}
+    assert cpu["type"] == "gauge", "percentual vira velocímetro"
+    assert cpu["gridPos"] == {"x": 0, "y": 0, "w": 6, "h": 6}
+    assert memory["gridPos"] == {"x": 6, "y": 0, "w": 6, "h": 6}
     assert cpu["fieldConfig"]["defaults"]["unit"] == "percent"
     target = cpu["targets"][0]
     assert target["group"] == {"filter": "Linux servers"}
@@ -99,10 +100,52 @@ async def test_create_host_dashboard_with_chosen_items(
         )
 
     assert not result.is_error, text_of(result)
-    assert result.structured_content["panels"] == ["Interface eth0: Bits sent", "CPU utilization"]
+    # O velocímetro de CPU sobe para o topo; o gráfico de rede vai para a linha de baixo.
+    assert result.structured_content["panels"] == ["CPU utilization", "Interface eth0: Bits sent"]
     saved = grafana.dashboards[result.structured_content["uid"]]
-    assert saved["panels"][0]["fieldConfig"]["defaults"]["unit"] == "bps"
-    assert saved["panels"][1]["gridPos"]["x"] == 12
+    gauge, graph = saved["panels"]
+    assert graph["type"] == "timeseries"
+    assert graph["fieldConfig"]["defaults"]["unit"] == "bps"
+    assert graph["gridPos"] == {"x": 0, "y": 6, "w": 12, "h": 8}
+
+
+async def test_panel_types_and_colors_follow_the_item(
+    make_client: MakeClient, fake: FakeZabbix, grafana: FakeGrafana
+) -> None:
+    host_id = add_host(fake, "db-01")
+    add_items(
+        fake,
+        host_id,
+        ("CPU utilization", "0", "%"),
+        ("Free swap space in %", "0", "%"),
+        ("Interface eth0: Inbound packets with errors", "3", ""),
+        ("System uptime", "3", "uptime"),
+        ("Load average (1m avg)", "0", ""),
+    )
+    names = ["Load average (1m avg)", "CPU utilization", "Free swap space in %",
+             "Interface eth0: Inbound packets with errors", "System uptime"]
+
+    async with make_client() as client:
+        result = await client.call_tool("create_host_dashboard", {"host": "db-01", "items": names})
+
+    assert not result.is_error, text_of(result)
+    panels = {p["title"]: p for p in grafana.dashboards[f"zbx-{host_id}"]["panels"]}
+
+    def colors(title: str) -> list[str]:
+        return [s["color"] for s in panels[title]["fieldConfig"]["defaults"]["thresholds"]["steps"]]
+
+    assert panels["CPU utilization"]["type"] == "gauge"
+    assert colors("CPU utilization") == ["green", "yellow", "red"]
+    assert colors("Free swap space in %") == ["red", "yellow", "green"], "livre: pouco é ruim"
+    assert panels["Interface eth0: Inbound packets with errors"]["type"] == "stat"
+    assert colors("Interface eth0: Inbound packets with errors") == ["green", "red"]
+    assert panels["System uptime"]["fieldConfig"]["defaults"]["unit"] == "dtdurations"
+    assert panels["Load average (1m avg)"]["type"] == "timeseries"
+    # Ordem: números no topo, velocímetros no meio, gráficos embaixo.
+    assert result.structured_content["panels"][:2] == [
+        "Interface eth0: Inbound packets with errors", "System uptime"
+    ]
+    assert result.structured_content["panels"][-1] == "Load average (1m avg)"
 
 
 async def test_create_host_dashboard_rejects_unknown_and_text_items(

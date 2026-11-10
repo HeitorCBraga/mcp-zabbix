@@ -1429,26 +1429,108 @@ DEFAULT_DASHBOARD_ITEMS: Final = (
     "Free swap space in %",
 )
 # Unidade do item no Zabbix → unidade do painel no Grafana.
-GRAFANA_UNITS: Final = {"%": "percent", "B": "bytes", "bps": "bps", "s": "s", "Bps": "Bps"}
+GRAFANA_UNITS: Final = {
+    "%": "percent",
+    "B": "bytes",
+    "bps": "bps",
+    "s": "s",
+    "Bps": "Bps",
+    "uptime": "dtdurations",
+    "unixtime": "dateTimeAsIso",
+}
 GRAFANA_ZABBIX_DATASOURCE: Final = "alexanderzobnin-zabbix-datasource"
+
+# Cores por faixa de valor (thresholds). O primeiro passo vale a partir de "menos infinito".
+THRESHOLDS_HIGH_IS_BAD: Final = [  # uso: CPU, memória, disco usado
+    {"color": "green", "value": None},
+    {"color": "yellow", "value": 70},
+    {"color": "red", "value": 90},
+]
+THRESHOLDS_LOW_IS_BAD: Final = [  # livre/disponível: pouco sobrando é ruim
+    {"color": "red", "value": None},
+    {"color": "yellow", "value": 10},
+    {"color": "green", "value": 25},
+]
+THRESHOLDS_ANY_IS_BAD: Final = [  # erros, descartes, fila: qualquer valor acima de 0 é alerta
+    {"color": "green", "value": None},
+    {"color": "red", "value": 1},
+]
+THRESHOLDS_INFO: Final = [{"color": "blue", "value": None}]
+
+# Tamanho (largura, altura) de cada tipo; a grade do Grafana tem 24 colunas.
+PANEL_SIZES: Final = {"stat": (6, 5), "gauge": (6, 6), "timeseries": (12, 8)}
+# Ordem no dashboard: números no topo, velocímetros, depois os gráficos.
+PANEL_ORDER: Final = ("stat", "gauge", "timeseries")
+
+
+def _panel_style(item: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """Escolhe o tipo de painel e as cores a partir do nome e da unidade do item."""
+    name = item["name"].lower()
+    units = item.get("units") or ""
+    if any(word in name for word in ("error", "discarded", "queue")):
+        return "stat", THRESHOLDS_ANY_IS_BAD
+    if units in ("uptime", "unixtime") or name.startswith(("total ", "number of cpus")):
+        return "stat", THRESHOLDS_INFO
+    if units == "%":
+        if "free" in name or "available" in name:
+            return "gauge", THRESHOLDS_LOW_IS_BAD
+        return "gauge", THRESHOLDS_HIGH_IS_BAD
+    return "timeseries", THRESHOLDS_INFO
+
+
+def _layout(kinds: list[str]) -> list[dict[str, int]]:
+    """Posiciona os painéis da esquerda para a direita, quebrando linha quando enche."""
+    positions = []
+    x = y = row_height = 0
+    previous = None
+    for kind in kinds:
+        width, height = PANEL_SIZES[kind]
+        # Começa linha nova quando não cabe ou quando muda o tipo de painel.
+        if x + width > 24 or (previous and kind != previous and x > 0):
+            x, y, row_height = 0, y + row_height, 0
+        positions.append({"x": x, "y": y, "w": width, "h": height})
+        x += width
+        row_height = max(row_height, height)
+        previous = kind
+    return positions
 
 
 def _grafana_panel(
-    panel_id: int, item: dict[str, Any], group: str, host: str, datasource_uid: str
+    panel_id: int,
+    item: dict[str, Any],
+    kind: str,
+    thresholds: list[dict[str, Any]],
+    grid_pos: dict[str, int],
+    group: str,
+    host: str,
+    datasource_uid: str,
 ) -> dict[str, Any]:
-    """Um painel de série temporal para um item, dois painéis por linha."""
-    position = panel_id - 1
+    """Um painel (stat, gauge ou timeseries) para um item do Zabbix."""
     datasource = {"type": GRAFANA_ZABBIX_DATASOURCE, "uid": datasource_uid}
+    defaults: dict[str, Any] = {
+        "unit": GRAFANA_UNITS.get(item.get("units") or "", "short"),
+        "thresholds": {"mode": "absolute", "steps": thresholds},
+        "color": {"mode": "thresholds"},
+    }
+    last_value = {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False}}
+    if kind == "gauge":
+        defaults.update(min=0, max=100)
+        options = {**last_value, "showThresholdMarkers": True, "showThresholdLabels": False}
+    elif kind == "stat":
+        options = {**last_value, "colorMode": "background", "graphMode": "area", "textMode": "value"}
+    else:
+        # Gráfico: cada painel ganha uma cor da paleta, com área em degradê.
+        defaults["color"] = {"mode": "palette-classic-by-name"}
+        defaults["custom"] = {"lineWidth": 2, "fillOpacity": 25, "gradientMode": "opacity", "showPoints": "never"}
+        options = {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "single"}}
     return {
         "id": panel_id,
-        "type": "timeseries",
+        "type": kind,
         "title": item["name"],
-        "gridPos": {"x": (position % 2) * 12, "y": (position // 2) * 8, "w": 12, "h": 8},
+        "gridPos": grid_pos,
         "datasource": datasource,
-        "fieldConfig": {
-            "defaults": {"unit": GRAFANA_UNITS.get(item.get("units", ""), "short")},
-            "overrides": [],
-        },
+        "options": options,
+        "fieldConfig": {"defaults": defaults, "overrides": []},
         "targets": [
             {
                 "refId": "A",
@@ -1477,8 +1559,10 @@ async def create_host_dashboard(
     ] = None,
     title: Annotated[str | None, Field(description="Título do dashboard. Padrão: nome do host.")] = None,
 ) -> dict[str, Any]:
-    """Cria no Grafana um dashboard com um gráfico por item numérico de um host do
-    Zabbix, lido pelo plugin do Zabbix. Chamar de novo com o mesmo host e o mesmo
+    """Cria no Grafana um dashboard com um painel por item numérico de um host do
+    Zabbix, lido pelo plugin do Zabbix. O tipo do painel sai do item: percentuais
+    viram velocímetro (gauge), erros/fila/totais/uptime viram número (stat) com cor
+    por faixa, e o resto vira gráfico de linha. Chamar de novo com o mesmo host e o mesmo
     título atualiza esse dashboard em vez de criar outro; outro título cria outro."""
     _ensure_writable(ctx)
     found = await _find_host(ctx, host, selectHostGroups=["name"])
@@ -1514,6 +1598,14 @@ async def create_host_dashboard(
                 "Informe 'items' com nomes de list_items."
             )
 
+    # Estilo de cada item, ordenado por tipo (números, velocímetros, gráficos).
+    styled = sorted(
+        ((item, *_panel_style(item)) for item in chosen),
+        key=lambda entry: PANEL_ORDER.index(entry[1]),
+    )
+    chosen = [item for item, _, _ in styled]
+    positions = _layout([kind for _, kind, _ in styled])
+
     grafana = _grafana(ctx).settings
     dashboard_title = (title or "").strip() or found["name"]
     # uid estável por host + título: repetir a chamada atualiza o mesmo dashboard.
@@ -1527,8 +1619,10 @@ async def create_host_dashboard(
         "time": {"from": "now-6h", "to": "now"},
         "refresh": "1m",
         "panels": [
-            _grafana_panel(n, item, groups[0], found["name"], grafana.datasource_uid)
-            for n, item in enumerate(chosen, start=1)
+            _grafana_panel(
+                n, item, kind, thresholds, grid_pos, groups[0], found["name"], grafana.datasource_uid
+            )
+            for n, ((item, kind, thresholds), grid_pos) in enumerate(zip(styled, positions), start=1)
         ],
     }
     saved = await _grafana_call(ctx, "save_dashboard", dashboard)
